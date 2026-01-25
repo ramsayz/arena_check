@@ -6,17 +6,18 @@ from collections import defaultdict
 def extract_arena(file_path, workflow_path):
 
     # --------------------------------------------------
-    # 1. Read workflow (Arena funds only)
+    # 1. Read workflow
     # --------------------------------------------------
     wf = pd.read_excel(workflow_path)
     wf = wf[wf["Fund Name"].str.contains("Arena", case=False, na=False)]
     wf = wf.reset_index(drop=True)
+    fund_count = len(wf)
 
-    if wf.empty:
-        raise ValueError("Arena: No Arena funds found in workflow")
+    if fund_count == 0:
+        raise ValueError("Arena: No Arena funds in workflow")
 
     # --------------------------------------------------
-    # 2. Read all characters from PDF
+    # 2. Read PDF characters
     # --------------------------------------------------
     chars = []
     with pdfplumber.open(file_path) as pdf:
@@ -27,106 +28,90 @@ def extract_arena(file_path, workflow_path):
         raise ValueError("Arena PDF: No text extracted")
 
     # --------------------------------------------------
-    # 3. Group characters by Y-position (rows)
+    # 3. Group characters by row (Y)
     # --------------------------------------------------
     rows = defaultdict(list)
     for c in chars:
         rows[round(c["top"], 1)].append(c)
 
     # --------------------------------------------------
-    # 4. Identify NAV row and MTD row
+    # 4. Column clustering by x-center
     # --------------------------------------------------
-    nav_row = None
-    mtd_row = None
-
-    for row in rows.values():
-        text = "".join(ch["text"] for ch in row)
-
-        # NAV row → many comma numbers, no %
-        if nav_row is None and "%" not in text and len(re.findall(r"\d{1,3},\d{3}", text)) >= 5:
-            nav_row = row
-
-        # MTD row → contains %
-        if mtd_row is None and "%" in text:
-            mtd_row = row
-
-    if nav_row is None or mtd_row is None:
-        raise ValueError("Arena PDF: NAV or MTD row not found")
-
-    # --------------------------------------------------
-    # 5. Cluster characters into columns using x-centers
-    # --------------------------------------------------
-    def cluster_columns(row, tolerance=8):
-        columns = []
+    def cluster_columns(row, tol=8):
+        cols = []
         for c in sorted(row, key=lambda x: (x["x0"] + x["x1"]) / 2):
             cx = (c["x0"] + c["x1"]) / 2
             placed = False
-            for col in columns:
-                if abs(cx - col["cx"]) <= tolerance:
+            for col in cols:
+                if abs(cx - col["cx"]) <= tol:
                     col["chars"].append(c)
                     placed = True
                     break
             if not placed:
-                columns.append({"cx": cx, "chars": [c]})
-        return columns
-
-    nav_cols = cluster_columns(nav_row)
-    mtd_cols = cluster_columns(mtd_row)
+                cols.append({"cx": cx, "chars": [c]})
+        return cols
 
     # --------------------------------------------------
-    # 6. Extract NAV values (STRICT)
+    # 5. Find NAV row (FIRST valid one only)
     # --------------------------------------------------
-    nav_values = []
-    for col in nav_cols:
-        raw = "".join(c["text"] for c in col["chars"])
-        cleaned = raw.replace(",", "").strip()
+    nav_values = None
 
-        # skip dates / fragments / empty
-        if not cleaned:
-            continue
-        if "/" in cleaned:
-            continue
-        if not cleaned.isdigit():
-            continue
+    for row in sorted(rows.values(), key=lambda r: r[0]["top"]):
+        cols = cluster_columns(row)
+        vals = []
 
-        nav_values.append(float(cleaned))
+        for col in cols:
+            raw = "".join(c["text"] for c in col["chars"])
+            cleaned = raw.replace(",", "").strip()
 
-    # --------------------------------------------------
-    # 7. Extract MTD values (STRICT)
-    # --------------------------------------------------
-    mtd_values = []
-    for col in mtd_cols:
-        raw = "".join(c["text"] for c in col["chars"])
-        cleaned = raw.replace("%", "").strip()
+            if not cleaned:
+                continue
+            if "/" in cleaned:
+                continue
+            if not cleaned.isdigit():
+                continue
 
-        if not cleaned:
-            continue
-        if "/" in cleaned:
-            continue
+            vals.append(float(cleaned))
 
-        try:
-            mtd_values.append(float(cleaned))
-        except ValueError:
-            continue
+        if len(vals) == fund_count:
+            nav_values = vals
+            break
+
+    if nav_values is None:
+        raise ValueError("Arena PDF: NAV row not found")
 
     # --------------------------------------------------
-    # 8. Hard validation (no silent corruption)
+    # 6. Find MTD row (FIRST valid one only)
     # --------------------------------------------------
-    if not nav_values or not mtd_values:
-        raise ValueError("Arena PDF: NAV or MTD values empty after extraction")
+    mtd_values = None
 
-    if len(nav_values) != len(mtd_values):
-        raise ValueError(
-            f"Arena mismatch: NAV={len(nav_values)}, MTD={len(mtd_values)}"
-        )
+    for row in sorted(rows.values(), key=lambda r: r[0]["top"]):
+        cols = cluster_columns(row)
+        vals = []
 
-    if len(nav_values) != len(wf):
-        raise ValueError(
-            f"Arena vs Workflow mismatch: Arena={len(nav_values)}, Workflow={len(wf)}"
-        )
+        for col in cols:
+            raw = "".join(c["text"] for c in col["chars"])
+            cleaned = raw.replace("%", "").strip()
+
+            if not cleaned:
+                continue
+            if "/" in cleaned:
+                continue
+
+            try:
+                vals.append(float(cleaned))
+            except ValueError:
+                continue
+
+        if len(vals) == fund_count:
+            mtd_values = vals
+            break
+
+    if mtd_values is None:
+        raise ValueError("Arena PDF: MTD row not found")
 
     # --------------------------------------------------
-    # 9. Build final output
+    # 7. Build output
     # --------------------------------------------------
     wf["NAV"] = nav_values
     wf["MTD"] = mtd_values
