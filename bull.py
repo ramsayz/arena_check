@@ -28,90 +28,79 @@ def extract_arena(file_path, workflow_path):
         raise ValueError("Arena PDF: No text extracted")
 
     # --------------------------------------------------
-    # 3. Group characters by row (Y)
+    # 3. Group chars into rows
     # --------------------------------------------------
     rows = defaultdict(list)
     for c in chars:
         rows[round(c["top"], 1)].append(c)
 
     # --------------------------------------------------
-    # 4. Column clustering by x-center
+    # 4. Merge characters into numeric tokens
     # --------------------------------------------------
-    def cluster_columns(row, tol=8):
-        cols = []
-        for c in sorted(row, key=lambda x: (x["x0"] + x["x1"]) / 2):
-            cx = (c["x0"] + c["x1"]) / 2
-            placed = False
-            for col in cols:
-                if abs(cx - col["cx"]) <= tol:
-                    col["chars"].append(c)
-                    placed = True
-                    break
-            if not placed:
-                cols.append({"cx": cx, "chars": [c]})
-        return cols
+    def build_tokens(row):
+        row = sorted(row, key=lambda x: x["x0"])
+        tokens = []
+        current = [row[0]]
+
+        for c in row[1:]:
+            if c["x0"] - current[-1]["x1"] <= 2:  # tight digit spacing
+                current.append(c)
+            else:
+                tokens.append(current)
+                current = [c]
+
+        tokens.append(current)
+        return tokens
 
     # --------------------------------------------------
-    # 5. Find NAV row (FIRST valid one only)
+    # 5. Find NAV row
     # --------------------------------------------------
     nav_values = None
 
     for row in sorted(rows.values(), key=lambda r: r[0]["top"]):
-        cols = cluster_columns(row)
-        vals = []
+        tokens = build_tokens(row)
+        values = []
 
-        for col in cols:
-            raw = "".join(c["text"] for c in col["chars"])
-            cleaned = raw.replace(",", "").strip()
-
-            if not cleaned:
+        for tok in tokens:
+            text = "".join(c["text"] for c in tok).replace(",", "").strip()
+            if "/" in text or not text.isdigit():
                 continue
-            if "/" in cleaned:
-                continue
-            if not cleaned.isdigit():
-                continue
+            values.append(float(text))
 
-            vals.append(float(cleaned))
-
-        if len(vals) == fund_count:
-            nav_values = vals
+        if len(values) >= fund_count:
+            nav_values = values[:fund_count]
             break
 
     if nav_values is None:
         raise ValueError("Arena PDF: NAV row not found")
 
     # --------------------------------------------------
-    # 6. Find MTD row (FIRST valid one only)
+    # 6. Find MTD row
     # --------------------------------------------------
     mtd_values = None
 
     for row in sorted(rows.values(), key=lambda r: r[0]["top"]):
-        cols = cluster_columns(row)
-        vals = []
+        tokens = build_tokens(row)
+        values = []
 
-        for col in cols:
-            raw = "".join(c["text"] for c in col["chars"])
-            cleaned = raw.replace("%", "").strip()
-
-            if not cleaned:
+        for tok in tokens:
+            text = "".join(c["text"] for c in tok).replace("%", "").strip()
+            if "/" in text:
                 continue
-            if "/" in cleaned:
-                continue
-
             try:
-                vals.append(float(cleaned))
+                values.append(float(text))
             except ValueError:
                 continue
 
-        if len(vals) == fund_count:
-            mtd_values = vals
+        if len(values) >= fund_count:
+            mtd_values = values[:fund_count]
             break
 
     if mtd_values is None:
         raise ValueError("Arena PDF: MTD row not found")
 
     # --------------------------------------------------
-    # 7. Build output
+    # 7. Output
     # --------------------------------------------------
     wf["NAV"] = nav_values
     wf["MTD"] = mtd_values
