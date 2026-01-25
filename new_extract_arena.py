@@ -1,22 +1,19 @@
 import pdfplumber
 import pandas as pd
 import re
+from collections import defaultdict
 
 def extract_arena(file_path, workflow_path):
 
-    # -------------------------------------------------
-    # 1. Read workflow (Arena funds only)
-    # -------------------------------------------------
+    # 1. Read workflow
     wf = pd.read_excel(workflow_path)
     wf = wf[wf["Fund Name"].str.contains("Arena", case=False, na=False)]
     wf = wf.reset_index(drop=True)
 
     if wf.empty:
-        raise ValueError("Arena: No Arena funds found in workflow")
+        raise ValueError("Arena: No Arena funds in workflow")
 
-    # -------------------------------------------------
-    # 2. Read PDF characters
-    # -------------------------------------------------
+    # 2. Read all chars
     chars = []
     with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
@@ -25,101 +22,75 @@ def extract_arena(file_path, workflow_path):
     if not chars:
         raise ValueError("Arena PDF: No text extracted")
 
-    # -------------------------------------------------
-    # 3. Group characters by Y (rows)
-    # -------------------------------------------------
-    rows = {}
+    # 3. Group chars by Y (rows)
+    rows = defaultdict(list)
     for c in chars:
-        y = round(c["top"], 1)
-        rows.setdefault(y, []).append(c)
+        rows[round(c["top"], 1)].append(c)
 
-    # -------------------------------------------------
     # 4. Identify NAV row and MTD row by content
-    # -------------------------------------------------
     nav_row = None
     mtd_row = None
 
-    for y, row in rows.items():
-        text = "".join(ch["text"] for ch in row)
+    for row in rows.values():
+        text = "".join(c["text"] for c in row)
 
-        # NAV row: many comma numbers, no %
         if nav_row is None and len(re.findall(r"\d{1,3},\d{3}", text)) >= 5 and "%" not in text:
             nav_row = row
 
-        # MTD row: % values
         if mtd_row is None and "%" in text:
             mtd_row = row
 
     if nav_row is None or mtd_row is None:
-        raise ValueError("Arena PDF: Could not locate NAV or MTD row")
+        raise ValueError("Arena PDF: NAV or MTD row not found")
 
-    # -------------------------------------------------
-    # 5. Split a row into columns using X gaps
-    # -------------------------------------------------
-    def split_into_columns(row, gap=25):
-        row = sorted(row, key=lambda x: x["x0"])
+    # 5. Cluster characters into columns using X-center
+    def cluster_columns(row, tol=8):
         cols = []
-        current = [row[0]]
+        for c in sorted(row, key=lambda x: (x["x0"] + x["x1"]) / 2):
+            cx = (c["x0"] + c["x1"]) / 2
+            placed = False
+            for col in cols:
+                col_cx = col["cx"]
+                if abs(cx - col_cx) <= tol:
+                    col["chars"].append(c)
+                    placed = True
+                    break
+            if not placed:
+                cols.append({"cx": cx, "chars": [c]})
+        return cols
 
-        for c in row[1:]:
-            if c["x0"] - current[-1]["x1"] <= gap:
-                current.append(c)
-            else:
-                cols.append(current)
-                current = [c]
+    nav_cols = cluster_columns(nav_row)
+    mtd_cols = cluster_columns(mtd_row)
 
-        cols.append(current)
-
-        return [
-            "".join(ch["text"] for ch in col).strip()
-            for col in cols
-        ]
-
-    nav_cols = split_into_columns(nav_row)
-    mtd_cols = split_into_columns(mtd_row)
-
-    # -------------------------------------------------
-    # 6. Extract NAV values (skip DATE column)
-    # -------------------------------------------------
+    # 6. Extract NAV values (skip date column)
     nav_values = []
     for col in nav_cols:
-        c = col.replace(" ", "")
-
-        # skip date column
-        if "/" in c:
+        text = "".join(c["text"] for c in col["chars"]).replace(" ", "")
+        if "/" in text:
             continue
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", text):
+            nav_values.append(float(text.replace(",", "")))
 
-        # strict NAV pattern
-        if re.fullmatch(r"\d{1,3}(?:,\d{3})+", c):
-            nav_values.append(float(c.replace(",", "")))
-
-    # -------------------------------------------------
     # 7. Extract MTD values
-    # -------------------------------------------------
     mtd_values = []
     for col in mtd_cols:
-        if "%" in col:
-            mtd_values.append(float(col.replace("%", "").strip()))
+        text = "".join(c["text"] for c in col["chars"])
+        if "%" in text:
+            mtd_values.append(float(text.replace("%", "").strip()))
 
-    # -------------------------------------------------
-    # 8. HARD VALIDATION (no silent corruption)
-    # -------------------------------------------------
+    # 8. Hard validation
     if not nav_values or not mtd_values:
         raise ValueError("Arena PDF: NAV or MTD values empty after extraction")
 
     if len(nav_values) != len(mtd_values):
-        raise ValueError(
-            f"Arena PDF mismatch: NAV={len(nav_values)}, MTD={len(mtd_values)}"
-        )
+        raise ValueError(f"Arena mismatch: NAV={len(nav_values)}, MTD={len(mtd_values)}")
 
     if len(nav_values) != len(wf):
         raise ValueError(
             f"Arena vs Workflow mismatch: Arena={len(nav_values)}, Workflow={len(wf)}"
         )
 
-    # -------------------------------------------------
-    # 9. Build final output
-    # -------------------------------------------------
+    # 9. Output
     wf["NAV"] = nav_values
     wf["MTD"] = mtd_values
     wf["Variance"] = abs(wf["MTD"])
