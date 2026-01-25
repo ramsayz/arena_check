@@ -1,65 +1,71 @@
 def extract_arena(file_path, workflow_path):
     import pdfplumber
     import pandas as pd
+    import re
 
-    # -----------------------------
-    # 1. Extract characters
-    # -----------------------------
+    # -------------------------------------------------
+    # 1. Read characters from first page
+    # -------------------------------------------------
     with pdfplumber.open(file_path) as pdf:
         page = pdf.pages[0]
         chars = page.chars
 
-    # -----------------------------
-    # 2. Group chars by Y (rows)
-    # -----------------------------
+    if not chars:
+        raise ValueError("Arena PDF: no characters extracted")
+
+    # -------------------------------------------------
+    # 2. Group characters by Y position (rows)
+    # -------------------------------------------------
     rows = {}
     for c in chars:
         y = round(c["top"], 1)
         rows.setdefault(y, []).append(c)
 
-    # -----------------------------
-    # 3. Rebuild row text
-    # -----------------------------
+    # -------------------------------------------------
+    # 3. Rebuild text per row (purely for token search)
+    # -------------------------------------------------
     row_text = {}
     for y, rchars in rows.items():
         text = "".join(
             c["text"] for c in sorted(rchars, key=lambda x: x["x0"])
         )
-        row_text[y] = text.strip()
+        row_text[y] = text
 
-    # -----------------------------
-    # 4. Identify NAV and MTD rows
-    # -----------------------------
-    nav_row = None
-    mtd_row = None
+    # -------------------------------------------------
+    # 4. Numeric-density detection (THE KEY FIX)
+    # -------------------------------------------------
+    row_metrics = {}
 
     for y, text in row_text.items():
-        if "," in text and "%" not in text:
-            nav_row = text
-        elif "%" in text:
-            mtd_row = text
+        nav_nums = re.findall(r'\d{1,3}(?:,\d{3})+', text)
+        mtd_nums = re.findall(r'-?\d+\.\d+%', text)
 
-    if nav_row is None or mtd_row is None:
-        raise ValueError("Could not locate NAV or MTD row in Arena PDF")
+        row_metrics[y] = {
+            "nav_count": len(nav_nums),
+            "mtd_count": len(mtd_nums),
+            "nav_nums": nav_nums,
+            "mtd_nums": mtd_nums
+        }
 
-    # -----------------------------
-    # 5. Extract numeric values
-    # -----------------------------
-    nav_values = [
-        float(x.replace(",", ""))
-        for x in nav_row.split()
-        if "," in x
-    ]
+    # NAV row = row with MAX comma-number count
+    nav_row_y = max(row_metrics, key=lambda y: row_metrics[y]["nav_count"])
+    mtd_row_y = max(row_metrics, key=lambda y: row_metrics[y]["mtd_count"])
 
-    mtd_values = [
-        float(x.replace("%", ""))
-        for x in mtd_row.split()
-        if "%" in x
-    ]
+    nav_tokens = row_metrics[nav_row_y]["nav_nums"]
+    mtd_tokens = row_metrics[mtd_row_y]["mtd_nums"]
 
-    # -----------------------------
-    # 6. Load workflow
-    # -----------------------------
+    if not nav_tokens or not mtd_tokens:
+        raise ValueError("Arena PDF: failed to detect NAV or MTD values")
+
+    # -------------------------------------------------
+    # 5. Convert values
+    # -------------------------------------------------
+    nav_values = [float(x.replace(",", "")) for x in nav_tokens]
+    mtd_values = [float(x.replace("%", "")) for x in mtd_tokens]
+
+    # -------------------------------------------------
+    # 6. Load workflow (SOURCE OF TRUTH)
+    # -------------------------------------------------
     wf = pd.read_excel(workflow_path)
     wf = wf[['Fund UCN', 'Fund Name', 'DATE', 'NAV (thous)']]
     wf.rename(columns={'NAV (thous)': 'Prev NAV'}, inplace=True)
@@ -67,18 +73,24 @@ def extract_arena(file_path, workflow_path):
     wf['NAV Date'] = nav_date(wf['DATE'].tolist())
     wf['NAV Date'] = wf['NAV Date'].dt.strftime("%m/%d/%Y")
 
-    # -----------------------------
-    # 7. Safety check
-    # -----------------------------
+    # -------------------------------------------------
+    # 7. HARD SAFETY CHECK (prevents silent corruption)
+    # -------------------------------------------------
     if len(nav_values) != len(wf):
         raise ValueError(
             f"Arena NAV count ({len(nav_values)}) "
             f"does not match workflow rows ({len(wf)})"
         )
 
-    # -----------------------------
-    # 8. Assign by index (KEY FIX)
-    # -----------------------------
+    if len(mtd_values) != len(wf):
+        raise ValueError(
+            f"Arena MTD count ({len(mtd_values)}) "
+            f"does not match workflow rows ({len(wf)})"
+        )
+
+    # -------------------------------------------------
+    # 8. Index-based assignment (ONLY CORRECT WAY)
+    # -------------------------------------------------
     wf['NAV'] = nav_values
     wf['MTD'] = mtd_values
 
