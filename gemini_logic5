@@ -1,0 +1,81 @@
+import pdfplumber
+import pandas as pd
+import re
+
+def clean_fund_name(text):
+    """Removes single lowercase letters and structural headers from fund names."""
+    # Remove single lowercase letters (watermark noise)
+    text = re.sub(r'\b[a-z]\b', '', text)
+    # Remove structural table headers often caught in the vertical sweep
+    text = re.sub(r'\b(Beginning|of|Month|AUM|Net|Returns)\b', '', text, flags=re.IGNORECASE)
+    return " ".join(text.split()).strip()
+
+def clean_mtd_value(text):
+    """Strips stray letters from MTD values, keeping only numbers, dots, and signs."""
+    if text == "N/A": return text
+    # Keep only digits, periods, commas, percent signs, and minus signs
+    cleaned = re.sub(r'[^0-9.\-%]', '', text)
+    return cleaned if cleaned else "N/A"
+
+def extract_arena_final_v3(pdf_path):
+    all_data = []
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        words = page.extract_words()
+        
+        # 1. Row Anchors
+        aum_row_y = next((w['top'] for w in words if "10/1/2025" in w['text']), None)
+        returns_row_y = next((w['top'] for w in words if "9/30/2025" in w['text']), None)
+
+        def get_unified_values(target_y, threshold=12):
+            """Unifies split numbers like '9' and '5,000,000'."""
+            row_words = [w for w in words if abs(w['top'] - target_y) < threshold and "/" not in w['text']]
+            row_words.sort(key=lambda x: x['x0'])
+            
+            unified = []
+            if not row_words: return unified
+            
+            curr = row_words[0]
+            for next_w in row_words[1:]:
+                # If horizontal gap is small, weld them
+                if (next_w['x0'] - curr['x1']) < 5:
+                    curr['text'] += next_w['text']
+                    curr['x1'] = next_w['x1']
+                else:
+                    unified.append(curr)
+                    curr = next_w
+            unified.append(curr)
+            return unified
+
+        aum_vals = get_unified_values(aum_row_y)
+        mtd_vals = get_unified_values(returns_row_y)
+
+        # 3. Match Columns
+        for aum in aum_vals:
+            # Reconstruct Fund Name by looking up
+            header_parts = [
+                w for w in words 
+                if abs(w['x0'] - aum['x0']) < 45 
+                and w['top'] < aum_row_y 
+                and w['top'] > (aum_row_y - 110)
+            ]
+            header_parts.sort(key=lambda x: (x['top'], x['x0']))
+            fund_name = clean_fund_name(" ".join([h['text'] for h in header_parts]))
+            
+            # Match MTD and apply the numerical-only filter
+            raw_mtd = next((m['text'] for m in mtd_vals if abs(m['x0'] - aum['x0']) < 30), "N/A")
+            mtd_clean = clean_mtd_value(raw_mtd)
+            
+            if len(fund_name) > 5:
+                all_data.append({
+                    "Fund Name": fund_name,
+                    "AUM (10/1/2025)": aum['text'],
+                    "MTD Return (9/30/2025)": mtd_clean
+                })
+
+    return pd.DataFrame(all_data)
+
+# Execution
+# df = extract_arena_final_v3("path_to_your_file.pdf")
+# print(df.to_string())
