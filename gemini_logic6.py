@@ -2,81 +2,82 @@ import pdfplumber
 import pandas as pd
 import re
 
-def clean_noise(text):
-    """Universal cleaner for watermark artifacts and headers."""
-    # Removes single lowercase characters (e.g., 'a', 'o', 'c', 'n')
+def clean_strict(text, is_mtd=False):
+    """Aggressively removes watermark noise and non-financial characters."""
+    if is_mtd:
+        # Keep only numbers, dots, and signs for MTD
+        cleaned = re.sub(r'[^0-9.\-%]', '', text)
+        return cleaned if cleaned else "N/A"
+    
+    # Remove single lowercase letters (watermark 'a', 'o', 'c', etc.)
     text = re.sub(r'\b[a-z]\b', '', text)
-    # Removes specific structural text that often bleeds into the extraction
-    text = re.sub(r'\b(Beginning|of|Month|AUM|Net|Returns|Arena)\b', '', text, flags=re.IGNORECASE)
+    # Remove table metadata that sits above the funds
+    text = re.sub(r'\b(Beginning|Month|AUM|Net|Returns|Fund|Value)\b', '', text, flags=re.IGNORECASE)
     return " ".join(text.split()).strip()
 
-def extract_adaptive_arena(pdf_path):
-    all_rows = []
+def extract_arena_surgical(pdf_path):
+    all_data = []
     
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
         
-        # 1. DYNAMIC ANCHORING: Find row Y-coordinates by searching for dates
-        # This handles PDFs where the table might be higher or lower on the page
-        aum_row_y = next((w['top'] for w in words if re.search(r'\d{1,2}/\d{1,2}/\d{4}', w['text']) and w['top'] < 400), None)
-        returns_row_y = next((w['top'] for w in words if re.search(r'\d{1,2}/\d{1,2}/\d{4}', w['text']) and w['top'] > 400), None)
+        # 1. Dynamically find the data rows by looking for date patterns
+        # Row 1: AUM (e.g., 10/1/2025) | Row 2: Returns (e.g., 9/30/2025)
+        aum_row = next((w for w in words if re.search(r'\d{1,2}/\d{1,2}/202', w['text']) and w['top'] < 400), None)
+        mtd_row = next((w for w in words if re.search(r'\d{1,2}/\d{1,2}/202', w['text']) and w['top'] > 400), None)
 
-        def get_row_values(target_y):
-            """Groups fragments into unified numbers based on proximity, not fixed positions."""
-            row_items = [w for w in words if abs(w['top'] - target_y) < 15 and not re.search(r'\d{1,2}/', w['text'])]
-            row_items.sort(key=lambda x: x['x0'])
+        if not aum_row or not mtd_row:
+            return "Required date rows not found."
+
+        # 2. Get numbers from the rows, merging fragments (like '9' and '5,000,000')
+        def get_merged_line_values(target_y):
+            line_words = [w for w in words if abs(w['top'] - target_y) < 10 and "/" not in w['text']]
+            line_words.sort(key=lambda x: x['x0'])
             
             merged = []
-            if not row_items: return merged
-            
-            curr = row_items[0]
-            for next_w in row_items[1:]:
-                # If the gap is small (< 5 pixels), it's the same number/value
-                if (next_w['x0'] - curr['x1']) < 5:
-                    curr['text'] += next_w['text']
-                    curr['x1'] = next_w['x1']
+            if not line_words: return merged
+            curr = line_words[0]
+            for nxt in line_words[1:]:
+                if (nxt['x0'] - curr['x1']) < 4: # Very tight gap = same number
+                    curr['text'] += nxt['text']
+                    curr['x1'] = nxt['x1']
                 else:
                     merged.append(curr)
-                    curr = next_w
+                    curr = nxt
             merged.append(curr)
             return merged
 
-        # 2. Extract values using the dynamic anchors
-        aum_list = get_row_values(aum_row_y)
-        mtd_list = get_row_values(returns_row_y)
+        aums = get_merged_line_values(aum_row['top'])
+        mtds = get_merged_line_values(mtd_row['top'])
 
-        # 3. MAPPING: Match Fund Names to AUM to MTD
-        for aum in aum_list:
-            # Look up vertically from the AUM value to collect the name
-            # We use the AUM's horizontal 'center' to find its column
-            mid_x = (aum['x0'] + aum['x1']) / 2
+        # 3. Use the horizontal center of each AUM as the search column
+        for aum in aums:
+            center_x = (aum['x0'] + aum['x1']) / 2
             
+            # SUCK UP: Only take text directly above this number's center
             header_parts = [
                 w for w in words 
-                if w['x0'] < mid_x + 20 and w['x1'] > mid_x - 20 # Column alignment
-                and w['top'] < aum_row_y - 10                    # Above the AUM row
-                and w['top'] > aum_row_y - 150                   # Within reasonable header height
+                if w['x0'] < center_x + 25 and w['x1'] > center_x - 25 # Strict column slice
+                and w['top'] < aum_row['top'] - 5                     # Above AUM row
+                and w['top'] > aum_row['top'] - 120                   # Below top logo
             ]
             header_parts.sort(key=lambda x: (x['top'], x['x0']))
             
-            fund_name = clean_noise(" ".join([h['text'] for h in header_parts]))
+            # Match MTD return in the same vertical slice
+            mtd_raw = next((m['text'] for m in mtds if abs(((m['x0']+m['x1'])/2) - center_x) < 30), "N/A")
             
-            # Match the MTD return in the same vertical column
-            mtd_match = next((m['text'] for m in mtd_list if abs(((m['x0']+m['x1'])/2) - mid_x) < 30), "N/A")
+            fund_name = clean_strict(" ".join([h['text'] for h in header_parts]))
             
-            # Clean the MTD (remove the 'a' artifact)
-            mtd_final = re.sub(r'[^0-9.\-%]', '', mtd_match) if mtd_match != "N/A" else "N/A"
-
-            if len(fund_name) > 2:
-                all_rows.append({
+            if len(fund_name) > 3:
+                all_data.append({
                     "Fund Name": fund_name,
-                    "AUM Value": aum['text'],
-                    "MTD Return": mtd_final if mtd_final else "N/A"
+                    "AUM (NAV)": aum['text'],
+                    "MTD Return": clean_strict(mtd_raw, is_mtd=True)
                 })
 
-    return pd.DataFrame(all_rows)
+    return pd.DataFrame(all_data)
 
-# Run
-# df = extract_adaptive_arena("new_report_file.pdf")
-# print(df)
+# Execution
+# df = extract_arena_surgical("arena_report.pdf")
+# print(df.to_string())
